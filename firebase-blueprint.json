@@ -1,0 +1,110 @@
+{
+  "entities": {
+    "project": {
+      "title": "Project",
+      "description": "HTML prototype review project",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "status": { "type": "string", "enum": ["draft", "in_review", "changes_requested", "approved", "archived"] },
+        "ownerId": { "type": "string" },
+        "ownerName": { "type": "string" },
+        "ownerEmail": { "type": "string" },
+        "htmlContent": { "type": "string" },
+        "version": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["title", "status", "ownerId", "htmlContent", "createdAt"]
+    },
+    "comment": {
+      "title": "Comment",
+      "description": "Pinpoint review comment on HTML screen",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string" },
+        "pinNumber": { "type": "number" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "targetSelector": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorEmail": { "type": "string" },
+        "authorRole": { "type": "string" },
+        "content": { "type": "string" },
+        "category": { "type": "string", "enum": ["bug", "design", "copy", "question", "general"] },
+        "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "status": { "type": "string", "enum": ["open", "in_progress", "resolved"] },
+        "suggestedChange": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["projectId", "pinNumber", "x", "y", "authorId", "authorName", "content", "status", "createdAt"]
+    },
+    "annotation": {
+      "title": "Annotation",
+      "description": "Visual drawing markup on the prototype canvas",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "type": { "type": "string", "enum": ["pencil", "rectangle", "arrow"] },
+        "points": { "type": "string" },
+        "color": { "type": "string" },
+        "strokeWidth": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["projectId", "authorId", "type", "points", "color", "createdAt"]
+    },
+    "activity": {
+      "title": "Activity",
+      "description": "Audit log for project status and review events",
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string" },
+        "actorName": { "type": "string" },
+        "action": { "type": "string" },
+        "details": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["projectId", "actorName", "action", "timestamp"]
+    },
+    "user": {
+      "title": "UserProfile",
+      "description": "Stakeholder user account profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["owner", "reviewer", "developer", "client"] },
+        "avatarColor": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name", "email", "role"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "user" },
+      "description": "Registered user accounts"
+    },
+    "/projects/{projectId}": {
+      "schema": { "$ref": "project" },
+      "description": "Collection of review projects"
+    },
+    "/projects/{projectId}/comments/{commentId}": {
+      "schema": { "$ref": "comment" },
+      "description": "Comments attached to this project prototype"
+    },
+    "/projects/{projectId}/annotations/{annotationId}": {
+      "schema": { "$ref": "annotation" },
+      "description": "Visual annotations attached to this project prototype"
+    },
+    "/projects/{projectId}/activities/{activityId}": {
+      "schema": { "$ref": "activity" },
+      "description": "Timeline activities for this project"
+    }
+  }
+}

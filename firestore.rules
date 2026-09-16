@@ -1,0 +1,83 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ----------------------------------------------------------------
+    // Helper functions
+    // ----------------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(projectData) {
+      return request.auth.uid == projectData.ownerId;
+    }
+
+    function isMember(projectData) {
+      return request.auth.token.email in projectData.memberEmails;
+    }
+
+    function canReadProject(projectData) {
+      return projectData.isPublic == true
+          || isOwner(projectData)
+          || isMember(projectData);
+    }
+
+    // ----------------------------------------------------------------
+    // Users
+    // ----------------------------------------------------------------
+
+    match /users/{userId} {
+      // Anyone signed in can read any user profile (for displaying names/avatars)
+      allow read: if isSignedIn();
+      // Only the owner of the profile can write it
+      allow write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // ----------------------------------------------------------------
+    // Projects
+    // ----------------------------------------------------------------
+
+    match /projects/{projectId} {
+      allow read: if isSignedIn() && canReadProject(resource.data);
+
+      // Any authenticated user can create a project
+      allow create: if isSignedIn();
+
+      // Members can update a project; only the owner can transfer ownership
+      allow update: if isSignedIn()
+                    && (isOwner(resource.data) || isMember(resource.data));
+
+      // Only the owner can delete a project
+      allow delete: if isSignedIn() && isOwner(resource.data);
+
+      // ----------------------------------------------------------------
+      // Comments
+      // ----------------------------------------------------------------
+
+      match /comments/{commentId} {
+        allow read, write: if isSignedIn()
+                           && canReadProject(get(/databases/$(database)/documents/projects/$(projectId)).data);
+      }
+
+      // ----------------------------------------------------------------
+      // Annotations
+      // ----------------------------------------------------------------
+
+      match /annotations/{annotationId} {
+        allow read, write: if isSignedIn()
+                           && canReadProject(get(/databases/$(database)/documents/projects/$(projectId)).data);
+      }
+
+      // ----------------------------------------------------------------
+      // Activity log
+      // ----------------------------------------------------------------
+
+      match /activities/{activityId} {
+        allow read, write: if isSignedIn()
+                           && canReadProject(get(/databases/$(database)/documents/projects/$(projectId)).data);
+      }
+    }
+  }
+}

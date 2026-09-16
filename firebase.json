@@ -1,0 +1,24 @@
+{
+  "firestore": [
+    {
+      "database": "ai-studio-htmlprototyperev-920b1745-c7c6-4c20-8a58-5533d9a211fd",
+      "rules": "firestore.rules"
+    }
+  ],
+
+  "hosting": {
+    "site": "proto-review",
+    "public": "dist",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}

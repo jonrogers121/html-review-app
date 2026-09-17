@@ -250,6 +250,9 @@ export default function App() {
     if (pinCoords.targetSelector) {
       commentPayload.targetSelector = pinCoords.targetSelector;
     }
+    if (pinCoords.targetText) {
+      commentPayload.targetText = pinCoords.targetText;
+    }
     if (typeof pinCoords.anchorX === 'number') {
       commentPayload.anchorX = pinCoords.anchorX;
     }

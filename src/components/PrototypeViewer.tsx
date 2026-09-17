@@ -16,9 +16,6 @@ import {
   coordsEqual,
   describeSelector,
   elementAtClientPoint,
-  getScrollParent,
-  inferElementAnchor,
-  listScrollableElements,
   resolvePinPosition,
   setHoverHighlight
 } from '../utils/pinAnchor';
@@ -113,13 +110,13 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
 
   const [hoveredSelector, setHoveredSelector] = useState<string>('');
   const [pinCoords, setPinCoords] = useState<Record<string, { left: number; top: number }>>({});
-  const inferredAnchorsRef = useRef<Record<string, PinPlacement>>({});
+  const [iframeHeight, setIframeHeight] = useState<number>(820);
   const commentsRef = useRef(comments);
   commentsRef.current = comments;
   const pendingPinRef = useRef(pendingPin);
   pendingPinRef.current = pendingPin;
 
-  // Highlight the prototype element a pin will attach to
+  // Highlight the hovered element during comment mode (visual feedback only)
   const prepareHtml = (rawHtml: string): string => {
     const helper = `
       <style id="review-tool-anchor-styles">
@@ -138,64 +135,87 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
     return `${rawHtml}${helper}`;
   };
 
-  const placementFor = useCallback(
-    (iframe: HTMLIFrameElement, pin: PinPlacement, cacheKey: string): PinPlacement => {
-      if (pin.targetSelector) {
-        return {
-          ...pin,
-          anchorX: pin.anchorX ?? 0.5,
-          anchorY: pin.anchorY ?? 0.5
-        };
-      }
-      const cached = inferredAnchorsRef.current[cacheKey];
-      if (cached) return cached;
-      const inferred = inferElementAnchor(iframe, pin);
-      if (inferred.targetSelector) {
-        inferredAnchorsRef.current[cacheKey] = inferred;
-      }
-      return inferred;
-    },
-    []
-  );
-
   const refreshPinCoords = useCallback(() => {
     const iframe = iframeRef.current;
     if (!iframe?.contentDocument) return;
 
     const next: Record<string, { left: number; top: number }> = {};
     for (const comment of commentsRef.current) {
-      next[comment.id] = resolvePinPosition(iframe, placementFor(iframe, comment, comment.id));
+      next[comment.id] = resolvePinPosition(iframe, comment);
     }
     const pending = pendingPinRef.current;
     if (pending) {
-      next.__pending = resolvePinPosition(iframe, placementFor(iframe, pending, '__pending'));
+      next.__pending = resolvePinPosition(iframe, pending);
     }
     setPinCoords((prev) => (coordsEqual(prev, next) ? prev : next));
-  }, [placementFor]);
+  }, []);
 
+  // Sync the iframe height to its content's full document height so the outer
+  // canvas handles all scrolling. This eliminates internal iframe scroll and
+  // means getBoundingClientRect() inside the iframe gives stable document-relative
+  // coords that can be used directly as absolute pin positions.
   useEffect(() => {
-    inferredAnchorsRef.current = {};
-  }, [project.htmlContent]);
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+
+    let ro: ResizeObserver | null = null;
+
+    const syncHeight = () => {
+      const doc = iframe.contentDocument;
+      if (!doc) return;
+      // Use standard max of documentElement and body scrollHeight
+      const h = Math.max(
+        doc.documentElement?.scrollHeight ?? 0,
+        doc.body?.scrollHeight ?? 0,
+        doc.documentElement?.offsetHeight ?? 0,
+        doc.body?.offsetHeight ?? 0,
+        820
+      );
+      setIframeHeight(h);
+      refreshPinCoords();
+    };
+
+    const attachObservers = () => {
+      syncHeight();
+      const doc = iframe.contentDocument;
+      if (!doc) return;
+      ro?.disconnect();
+      ro = new ResizeObserver(() => {
+        syncHeight();
+      });
+      if (doc.documentElement) ro.observe(doc.documentElement);
+      if (doc.body) ro.observe(doc.body);
+    };
+
+    iframe.addEventListener('load', attachObservers);
+    if (iframe.contentDocument?.readyState === 'complete') {
+      attachObservers();
+    }
+
+    // Schedule re-checks after viewport switch animation completes
+    const timer1 = setTimeout(syncHeight, 50);
+    const timer2 = setTimeout(syncHeight, 250);
+
+    return () => {
+      clearTimeout(timer1);
+      clearTimeout(timer2);
+      iframe.removeEventListener('load', attachObservers);
+      ro?.disconnect();
+    };
+  }, [project.htmlContent, viewportMode, zoomLevel, refreshPinCoords]);
 
   useEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe) return;
 
-    let iframeWin: Window | null = null;
     let resizeObserver: ResizeObserver | null = null;
-    const scrollables: HTMLElement[] = [];
     let raf = 0;
     let running = false;
 
     const detach = () => {
       running = false;
       cancelAnimationFrame(raf);
-      iframeWin?.removeEventListener('scroll', refreshPinCoords, true);
-      iframeWin?.removeEventListener('resize', refreshPinCoords);
-      scrollables.forEach((el) => el.removeEventListener('scroll', refreshPinCoords));
-      scrollables.length = 0;
       resizeObserver?.disconnect();
-      iframeWin = null;
       resizeObserver = null;
     };
 
@@ -208,20 +228,11 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
     const attach = () => {
       detach();
       const win = iframe.contentWindow;
-      const doc = iframe.contentDocument;
-      if (!win || !doc) return;
-      iframeWin = win;
+      if (!win) return;
       refreshPinCoords();
-      win.addEventListener('scroll', refreshPinCoords, true);
-      win.addEventListener('resize', refreshPinCoords);
-      listScrollableElements(doc).forEach((el) => {
-        el.addEventListener('scroll', refreshPinCoords, { passive: true });
-        scrollables.push(el);
-      });
+      // Observe iframe element size (viewport mode / zoom changes)
       resizeObserver = new ResizeObserver(refreshPinCoords);
       resizeObserver.observe(iframe);
-      if (doc.documentElement) resizeObserver.observe(doc.documentElement);
-      if (doc.body) resizeObserver.observe(doc.body);
       running = true;
       raf = requestAnimationFrame(tick);
     };
@@ -231,9 +242,15 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
       attach();
     }
 
+    // The outer canvas is the scroll container for the full-height iframe.
+    // Refresh pin coords whenever it scrolls so positions stay accurate.
+    const canvas = document.getElementById('prototype-viewport-canvas');
+    canvas?.addEventListener('scroll', refreshPinCoords, { passive: true });
     window.addEventListener('resize', refreshPinCoords);
+
     return () => {
       iframe.removeEventListener('load', attach);
+      canvas?.removeEventListener('scroll', refreshPinCoords);
       window.removeEventListener('resize', refreshPinCoords);
       detach();
     };
@@ -243,22 +260,21 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
     refreshPinCoords();
   }, [refreshPinCoords, comments, pendingPin, viewportMode, zoomLevel]);
 
-  // When a comment is selected in the sidebar, scroll its element into view
+  // When a comment is selected in the sidebar, scroll the outer canvas so
+  // the pin is centred in the viewport.
   useEffect(() => {
     if (!selectedCommentId) return;
     const iframe = iframeRef.current;
     const comment = commentsRef.current.find((c) => c.id === selectedCommentId);
-    const doc = iframe?.contentDocument;
-    if (!iframe || !comment || !doc) return;
-    const placement = placementFor(iframe, comment, comment.id);
-    if (!placement.targetSelector) return;
-    try {
-      const el = doc.querySelector(placement.targetSelector);
-      el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    } catch {
-      // Invalid or stale selector — leave the viewport where it is
-    }
-  }, [selectedCommentId, placementFor]);
+    if (!iframe || !comment) return;
+    const pinTop = pinCoords[comment.id]?.top ?? (comment.yPercent / 100) * iframe.clientHeight;
+    const canvas = document.getElementById('prototype-viewport-canvas');
+    if (!canvas) return;
+    canvas.scrollTo({
+      top: pinTop - canvas.clientHeight / 2,
+      behavior: 'smooth'
+    });
+  }, [selectedCommentId, pinCoords]);
 
   useEffect(() => {
     return () => {
@@ -359,25 +375,17 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
     const node = overlayRef.current;
     if (!node || !isOverlayActive) return;
     const onWheel = (event: WheelEvent) => {
-      const iframe = iframeRef.current;
-      const win = iframe?.contentWindow;
-      const doc = iframe?.contentDocument;
-      if (!iframe || !win || !doc) return;
-      const underCursor = elementAtClientPoint(iframe, event.clientX, event.clientY);
-      const scrollRoot =
-        getScrollParent(underCursor) ??
-        (doc.scrollingElement instanceof HTMLElement ? doc.scrollingElement : null);
-      if (scrollRoot) {
-        scrollRoot.scrollBy(event.deltaX, event.deltaY);
-      } else {
-        win.scrollBy(event.deltaX, event.deltaY);
+      // The iframe is now full-height (no internal scroll) so we forward wheel
+      // events to the outer prototype-viewport-canvas instead.
+      const canvas = document.getElementById('prototype-viewport-canvas');
+      if (canvas) {
+        canvas.scrollBy({ left: event.deltaX, top: event.deltaY });
       }
       event.preventDefault();
-      refreshPinCoords();
     };
     node.addEventListener('wheel', onWheel, { passive: false });
     return () => node.removeEventListener('wheel', onWheel);
-  }, [isOverlayActive, refreshPinCoords]);
+  }, [isOverlayActive]);
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden relative">
@@ -450,14 +458,14 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
         {/* Prototype Screen & Interactive Canvas */}
         <div
           ref={containerRef}
-          className={`relative w-full flex-1 rounded-b-xl overflow-hidden ${
+          className={`relative w-full rounded-b-xl ${
             activeTool === 'comment'
               ? 'cursor-crosshair'
               : ['pencil', 'rectangle', 'arrow'].includes(activeTool)
               ? 'cursor-cell'
               : 'cursor-default'
           }`}
-          style={{ minHeight: '820px' }}
+          style={{ height: iframeHeight }}
         >
           {/* Sandboxed HTML Prototype Iframe */}
           <iframe
@@ -465,7 +473,8 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
             title={project.title}
             srcDoc={prepareHtml(project.htmlContent)}
             sandbox="allow-scripts allow-same-origin"
-            className="w-full h-full min-h-[820px] border-none block bg-white"
+            className="w-full border-none block bg-white"
+            style={{ height: iframeHeight }}
           />
 
           {/* Interactive Annotation & Pin Layer (Intercepts clicks when not in 'browse' mode) */}

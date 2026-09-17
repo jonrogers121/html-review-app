@@ -32,6 +32,8 @@ export interface PinPlacement {
   xPercent: number; // 0 - 100, iframe-viewport fallback
   yPercent: number; // 0 - 100, iframe-viewport fallback
   targetSelector?: string;
+  /** Optional text content snippet to reliably re-identify the element even if class/DOM structure differs */
+  targetText?: string;
   /** Horizontal offset within the target element (0–1). Present on element-anchored pins. */
   anchorX?: number;
   /** Vertical offset within the target element (0–1). Present on element-anchored pins. */

@@ -2,6 +2,10 @@ import type { PinPlacement } from '../types';
 
 const SKIP_TAGS = new Set(['HTML', 'BR', 'SCRIPT', 'STYLE', 'LINK', 'META', 'HEAD', 'NOSCRIPT']);
 
+// ---------------------------------------------------------------------------
+// CSS selector helpers
+// ---------------------------------------------------------------------------
+
 function cssEscape(value: string): string {
   if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
     return CSS.escape(value);
@@ -9,13 +13,15 @@ function cssEscape(value: string): string {
   return value.replace(/([ !"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
 }
 
-function clamp01(value: number): number {
-  return Math.max(0, Math.min(1, value));
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
 }
 
 /**
- * Build a selector unique enough to find this node again after layout/viewport changes.
- * Prefers a unique id, then an nth-of-type path.
+ * Build a selector unique enough to re-find this element after a layout change
+ * (e.g. switching between desktop and mobile viewports).
+ * Walks up the DOM tree and uses nth-of-type on each element so that cards/sections
+ * in lists retain their exact index.
  */
 export function buildUniqueSelector(el: Element, root: Document = el.ownerDocument): string {
   if (el.id) {
@@ -23,27 +29,36 @@ export function buildUniqueSelector(el: Element, root: Document = el.ownerDocume
     try {
       if (root.querySelectorAll(idSel).length === 1) return idSel;
     } catch {
-      // Invalid id for a selector; fall through to a path.
+      // fall through
     }
   }
 
   const parts: string[] = [];
   let current: Element | null = el;
 
-  while (current && current !== root.documentElement) {
+  while (current && current !== root.documentElement && current !== root.body) {
     let part = current.tagName.toLowerCase();
 
     if (current.id) {
-      parts.unshift(`${part}#${cssEscape(current.id)}`);
-      break;
+      const idSel = `#${cssEscape(current.id)}`;
+      try {
+        if (root.querySelectorAll(idSel).length === 1) {
+          parts.unshift(`${part}${idSel}`);
+          break;
+        }
+      } catch {
+        // ignore
+      }
     }
 
     const parent = current.parentElement;
     if (parent) {
-      const sameTag = Array.from(parent.children).filter((child) => child.tagName === current!.tagName);
-      if (sameTag.length > 1) {
-        part += `:nth-of-type(${sameTag.indexOf(current) + 1})`;
-      }
+      // Use :nth-of-type so that list items / sibling cards are distinguished!
+      const siblingsWithTag = Array.from(parent.children).filter(
+        (child) => child.tagName === current!.tagName
+      );
+      const index = siblingsWithTag.indexOf(current) + 1;
+      part += `:nth-of-type(${index})`;
     }
 
     parts.unshift(part);
@@ -53,26 +68,12 @@ export function buildUniqueSelector(el: Element, root: Document = el.ownerDocume
   return parts.join(' > ') || el.tagName.toLowerCase();
 }
 
-export function describeSelector(selector: string): string {
-  const last = selector.split('>').pop()?.trim() ?? selector;
-  return last.replace(/^[#.]/, '');
-}
+// ---------------------------------------------------------------------------
+// Element hit-testing
+// ---------------------------------------------------------------------------
 
-function iframePointFromClient(
-  iframe: HTMLIFrameElement,
-  clientX: number,
-  clientY: number
-): { x: number; y: number } | null {
-  const rect = iframe.getBoundingClientRect();
-  if (rect.width === 0 || rect.height === 0) return null;
-  return {
-    x: ((clientX - rect.left) / rect.width) * iframe.clientWidth,
-    y: ((clientY - rect.top) / rect.height) * iframe.clientHeight
-  };
-}
-
-/** Smallest painted element under a point, skipping full-viewport layout shells. */
-export function pickTargetElement(doc: Document, x: number, y: number, viewportArea: number): Element | null {
+/** Smallest painted element under a point in the iframe document. */
+function pickTargetElement(doc: Document, x: number, y: number, viewportArea: number): Element | null {
   const stack =
     typeof doc.elementsFromPoint === 'function'
       ? doc.elementsFromPoint(x, y)
@@ -87,7 +88,11 @@ export function pickTargetElement(doc: Document, x: number, y: number, viewportA
     return el;
   }
 
-  return stack.find((el) => el instanceof Element && el.tagName !== 'BODY' && !SKIP_TAGS.has(el.tagName)) ?? null;
+  return (
+    stack.find(
+      (el) => el instanceof Element && el.tagName !== 'BODY' && !SKIP_TAGS.has(el.tagName)
+    ) ?? null
+  );
 }
 
 export function elementAtClientPoint(
@@ -96,137 +101,152 @@ export function elementAtClientPoint(
   clientY: number
 ): Element | null {
   const doc = iframe.contentDocument;
-  const point = iframePointFromClient(iframe, clientX, clientY);
-  if (!doc || !point) return null;
-  return pickTargetElement(doc, point.x, point.y, iframe.clientWidth * iframe.clientHeight);
+  const iRect = iframe.getBoundingClientRect();
+  if (!doc || iRect.width === 0 || iRect.height === 0) return null;
+  const x = ((clientX - iRect.left) / iRect.width) * iframe.clientWidth;
+  const y = ((clientY - iRect.top) / iRect.height) * iframe.clientHeight;
+  return pickTargetElement(doc, x, y, iframe.clientWidth * iframe.clientHeight);
 }
 
-export function getScrollParent(el: Element | null): HTMLElement | null {
-  let current: HTMLElement | null = el instanceof HTMLElement ? el : (el?.parentElement ?? null);
-  const view = current?.ownerDocument.defaultView;
-  if (!view) return null;
-
-  while (current) {
-    const style = view.getComputedStyle(current);
-    const overflowY = style.overflowY;
-    const overflowX = style.overflowX;
-    const scrollsY =
-      (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
-      current.scrollHeight > current.clientHeight + 1;
-    const scrollsX =
-      (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay') &&
-      current.scrollWidth > current.clientWidth + 1;
-    if (scrollsY || scrollsX) return current;
-    current = current.parentElement;
-  }
-  return null;
+export function describeSelector(selector: string): string {
+  const last = selector.split('>').pop()?.trim() ?? selector;
+  return last.replace(/^[#.]/, '');
 }
 
-export function listScrollableElements(doc: Document): HTMLElement[] {
-  const found: HTMLElement[] = [];
-  const view = doc.defaultView;
-  if (!view) return found;
-  const all = doc.querySelectorAll('body, body *');
-  all.forEach((node) => {
-    if (!(node instanceof HTMLElement)) return;
-    const style = view.getComputedStyle(node);
-    const overflowY = style.overflowY;
-    const overflowX = style.overflowX;
-    const scrollsY =
-      (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
-      node.scrollHeight > node.clientHeight + 1;
-    const scrollsX =
-      (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay') &&
-      node.scrollWidth > node.clientWidth + 1;
-    if (scrollsY || scrollsX) found.push(node);
+// ---------------------------------------------------------------------------
+// Hover highlight (visual feedback only)
+// ---------------------------------------------------------------------------
+
+export function setHoverHighlight(doc: Document | null, el: Element | null): void {
+  if (!doc) return;
+  doc.querySelectorAll('[data-review-anchor-hover]').forEach((node) => {
+    node.removeAttribute('data-review-anchor-hover');
   });
-  return found;
+  el?.setAttribute('data-review-anchor-hover', 'true');
 }
 
+// ---------------------------------------------------------------------------
+// Pin capture — stores element selector + text snippet + percentage fallback
+// ---------------------------------------------------------------------------
+
+/**
+ * Record where the user clicked. Stores:
+ *  - xPercent / yPercent as a document-relative percentage fallback
+ *  - targetSelector + anchorX/Y so the pin tracks its element across
+ *    viewport mode changes (desktop → tablet → mobile)
+ *  - targetText snippet for unambiguous re-identification across DOM variations
+ */
 export function capturePinAtPoint(
   iframe: HTMLIFrameElement,
   clientX: number,
   clientY: number
 ): PinPlacement | null {
-  const point = iframePointFromClient(iframe, clientX, clientY);
-  if (!point || iframe.clientWidth === 0 || iframe.clientHeight === 0) return null;
+  const iRect = iframe.getBoundingClientRect();
+  if (iRect.width === 0 || iRect.height === 0) return null;
+  if (iframe.clientWidth === 0 || iframe.clientHeight === 0) return null;
 
-  const xPercent = Math.max(0, Math.min(100, (point.x / iframe.clientWidth) * 100));
-  const yPercent = Math.max(0, Math.min(100, (point.y / iframe.clientHeight) * 100));
+  // Convert host-page viewport coords → iframe document coords
+  const x = ((clientX - iRect.left) / iRect.width) * iframe.clientWidth;
+  const y = ((clientY - iRect.top) / iRect.height) * iframe.clientHeight;
+
+  const xPercent = clamp01(x / iframe.clientWidth) * 100;
+  const yPercent = clamp01(y / iframe.clientHeight) * 100;
 
   const doc = iframe.contentDocument;
   const target = doc
-    ? pickTargetElement(doc, point.x, point.y, iframe.clientWidth * iframe.clientHeight)
+    ? pickTargetElement(doc, x, y, iframe.clientWidth * iframe.clientHeight)
     : null;
+
   if (!target) {
     return { xPercent, yPercent };
   }
 
+  // anchorX/Y = fractional offset within the element at click time
   const elRect = target.getBoundingClientRect();
-  const anchorX = elRect.width > 0 ? clamp01((point.x - elRect.left) / elRect.width) : 0.5;
-  const anchorY = elRect.height > 0 ? clamp01((point.y - elRect.top) / elRect.height) : 0.5;
+  const anchorX = elRect.width > 0 ? clamp01((x - elRect.left) / elRect.width) : 0.5;
+  const anchorY = elRect.height > 0 ? clamp01((y - elRect.top) / elRect.height) : 0.5;
+
+  const textContent = (target.textContent || '').trim().slice(0, 80);
 
   return {
     xPercent,
     yPercent,
     targetSelector: buildUniqueSelector(target, target.ownerDocument),
+    targetText: textContent || undefined,
     anchorX,
     anchorY
   };
 }
 
-/** Bind a legacy percent-only pin to whatever element currently sits under it. */
-export function inferElementAnchor(iframe: HTMLIFrameElement, pin: PinPlacement): PinPlacement {
-  if (pin.targetSelector) {
-    return {
-      ...pin,
-      anchorX: pin.anchorX ?? 0.5,
-      anchorY: pin.anchorY ?? 0.5
-    };
-  }
-  const doc = iframe.contentDocument;
-  if (!doc) return pin;
-  const x = (pin.xPercent / 100) * iframe.clientWidth;
-  const y = (pin.yPercent / 100) * iframe.clientHeight;
-  const target = pickTargetElement(doc, x, y, iframe.clientWidth * iframe.clientHeight);
-  if (!target) return pin;
-  const elRect = target.getBoundingClientRect();
-  return {
-    ...pin,
-    targetSelector: buildUniqueSelector(target, doc),
-    anchorX: elRect.width > 0 ? clamp01((x - elRect.left) / elRect.width) : 0.5,
-    anchorY: elRect.height > 0 ? clamp01((y - elRect.top) / elRect.height) : 0.5
-  };
-}
+// ---------------------------------------------------------------------------
+// Pin resolution — find the element in the current layout and return its
+// pixel position so the pin overlay can place the badge correctly.
+// ---------------------------------------------------------------------------
 
 function findAnchoredElement(
   doc: Document,
   selector: string,
-  fallback: { left: number; top: number }
+  targetText?: string,
+  fallback?: { left: number; top: number }
 ): Element | null {
-  const matches = Array.from(doc.querySelectorAll(selector));
+  let matches: Element[] = [];
+  try {
+    matches = Array.from(doc.querySelectorAll(selector));
+  } catch {
+    // selector might be invalid
+  }
+
+  // If exact selector didn't match, or matched multiple, use targetText if available
+  if (targetText && (matches.length === 0 || matches.length > 1)) {
+    const textNormalized = targetText.toLowerCase();
+    const textMatches = matches.filter(
+      (m) => (m.textContent || '').trim().toLowerCase().includes(textNormalized)
+    );
+    if (textMatches.length === 1) {
+      return textMatches[0];
+    } else if (textMatches.length > 1) {
+      matches = textMatches;
+    } else if (matches.length === 0) {
+      // Fallback: search anywhere in the document for elements matching text
+      const allWithText = Array.from(doc.querySelectorAll('h1, h2, h3, h4, h5, h6, p, span, a, div, li, td, th')).filter(
+        (el) => (el.textContent || '').trim().toLowerCase() === textNormalized
+      );
+      if (allWithText.length === 1) return allWithText[0];
+      if (allWithText.length > 1) matches = allWithText;
+    }
+  }
+
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0];
 
-  let best: Element | null = null;
-  let bestDist = Infinity;
-  for (const match of matches) {
-    const rect = match.getBoundingClientRect();
-    const contains =
-      fallback.left >= rect.left &&
-      fallback.left <= rect.left + rect.width &&
-      fallback.top >= rect.top &&
-      fallback.top <= rect.top + rect.height;
-    if (contains) return match;
-    const dist = Math.hypot(rect.left + rect.width / 2 - fallback.left, rect.top + rect.height / 2 - fallback.top);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = match;
+  // Multiple matches: choose the one closest to relative fallback percentage
+  if (fallback) {
+    let best: Element | null = null;
+    let bestDist = Infinity;
+    for (const match of matches) {
+      const rect = match.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dist = Math.hypot(cx - fallback.left, cy - fallback.top);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = match;
+      }
     }
+    return best;
   }
-  return best;
+
+  return matches[0];
 }
 
+/**
+ * Resolve a pin to { left, top } in the iframe/overlay coordinate space.
+ *
+ * - If the pin has a targetSelector (or targetText), we find the element in
+ *   the current layout (which differs between desktop and mobile) and return
+ *   its exact position.
+ * - Falls back to percentage-based positioning if the element cannot be found.
+ */
 export function resolvePinPosition(
   iframe: HTMLIFrameElement,
   pin: PinPlacement
@@ -237,33 +257,24 @@ export function resolvePinPosition(
   };
 
   const doc = iframe.contentDocument;
-  if (!doc || !pin.targetSelector) return fallback;
+  if (!doc || (!pin.targetSelector && !pin.targetText)) return fallback;
 
-  const anchorX = pin.anchorX ?? 0.5;
-  const anchorY = pin.anchorY ?? 0.5;
-
-  let el: Element | null = null;
-  try {
-    el = findAnchoredElement(doc, pin.targetSelector, fallback);
-  } catch {
-    return fallback;
-  }
+  const el = findAnchoredElement(doc, pin.targetSelector || '', pin.targetText, fallback);
   if (!el) return fallback;
 
   const rect = el.getBoundingClientRect();
+  const anchorX = pin.anchorX ?? 0.5;
+  const anchorY = pin.anchorY ?? 0.5;
+
   return {
     left: rect.left + rect.width * anchorX,
     top: rect.top + rect.height * anchorY
   };
 }
 
-export function setHoverHighlight(doc: Document | null, el: Element | null): void {
-  if (!doc) return;
-  doc.querySelectorAll('[data-review-anchor-hover]').forEach((node) => {
-    node.removeAttribute('data-review-anchor-hover');
-  });
-  el?.setAttribute('data-review-anchor-hover', 'true');
-}
+// ---------------------------------------------------------------------------
+// Equality guard — avoids unnecessary React re-renders in the rAF loop
+// ---------------------------------------------------------------------------
 
 export function coordsEqual(
   a: Record<string, { left: number; top: number }>,

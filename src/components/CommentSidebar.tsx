@@ -30,7 +30,6 @@ import type {
 } from '../types';
 import { DeleteConfirmModal } from './DeleteConfirmModal';
 import { showToast } from './Toast';
-import { describeSelector } from '../utils/pinAnchor';
 
 
 interface CommentSidebarProps {
@@ -290,14 +289,6 @@ export const CommentSidebar: React.FC<CommentSidebarProps> = ({
                 </div>
 
                 <div className="flex items-center gap-1.5 shrink-0">
-                  {pendingPin.targetSelector && (
-                    <span
-                      className="text-[10px] font-medium px-2 py-0.5 bg-indigo-100/70 text-indigo-800 rounded-md truncate max-w-[130px] border border-indigo-200/50"
-                      title={pendingPin.targetSelector}
-                    >
-                      {describeSelector(pendingPin.targetSelector)}
-                    </span>
-                  )}
                   <button
                     id="close-pending-pin-header-btn"
                     type="button"
@@ -568,14 +559,6 @@ export const CommentSidebar: React.FC<CommentSidebarProps> = ({
                         >
                           {comment.priority}
                         </span>
-                        {comment.targetSelector && (
-                          <span
-                            className="text-[10px] font-mono px-2 py-0.5 bg-slate-100 text-slate-600 rounded truncate max-w-[150px]"
-                            title={comment.targetSelector}
-                          >
-                            {describeSelector(comment.targetSelector)}
-                          </span>
-                        )}
                       </div>
 
                       {/* Comment text */}

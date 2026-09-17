@@ -1,5 +1,5 @@
-import React, { useRef, useState, useEffect, useCallback } from 'react';
-import { MousePointer, MessageSquarePlus, X, Sparkles } from 'lucide-react';
+import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
+import { MousePointer, MessageSquarePlus, X } from 'lucide-react';
 import { CanvasToolbar } from './CanvasToolbar';
 import type {
   Project,
@@ -11,14 +11,19 @@ import type {
   PinPlacement
 } from '../types';
 import {
-  buildUniqueSelector,
-  capturePinAtPoint,
-  coordsEqual,
-  describeSelector,
-  elementAtClientPoint,
-  resolvePinPosition,
-  setHoverHighlight
-} from '../utils/pinAnchor';
+  REVIEW_CANCEL_MESSAGE,
+  REVIEW_MODE_MESSAGE,
+  REVIEW_OPEN_PIN_MESSAGE,
+  REVIEW_PICK_MESSAGE,
+  REVIEW_PIN_LOCATE_MESSAGE,
+  REVIEW_PINS_MESSAGE,
+  REVIEW_SELECT_MESSAGE,
+  REVIEW_WHEEL_MESSAGE,
+  injectReviewBridge,
+  markersFromComments,
+  placementFromPick,
+  REVIEW_BRIDGE_VERSION
+} from '../utils/reviewBridge';
 
 interface PrototypeViewerProps {
   project: Project;
@@ -60,7 +65,14 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const svgOverlayRef = useRef<SVGSVGElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
+  const onDropPinRef = useRef(onDropPin);
+  onDropPinRef.current = onDropPin;
+  const onToolChangeRef = useRef(onToolChange);
+  onToolChangeRef.current = onToolChange;
+  const onSelectCommentRef = useRef(onSelectComment);
+  onSelectCommentRef.current = onSelectComment;
+  const selectedCommentIdRef = useRef(selectedCommentId);
+  selectedCommentIdRef.current = selectedCommentId;
 
   // Keyboard shortcut listeners (V for Browse, C for Pin, P for Pencil, R for Rectangle, A for Arrow)
   useEffect(() => {
@@ -97,8 +109,6 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
   const [drawPath, setDrawPath] = useState<string>('');
   const [startPoint, setStartPoint] = useState<{ x: number; y: number } | null>(null);
   const [currentPoint, setCurrentPoint] = useState<{ x: number; y: number } | null>(null);
-  const [hoveredPinId, setHoveredPinId] = useState<string | null>(null);
-  const [ghostPinPos, setGhostPinPos] = useState<{ x: number; y: number } | null>(null);
 
   // Viewport width constraints
   const viewportWidths: Record<ViewportMode, string> = {
@@ -108,52 +118,32 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
     fluid: '100%'
   };
 
-  const [hoveredSelector, setHoveredSelector] = useState<string>('');
-  const [pinCoords, setPinCoords] = useState<Record<string, { left: number; top: number }>>({});
   const [iframeHeight, setIframeHeight] = useState<number>(820);
-  const commentsRef = useRef(comments);
-  commentsRef.current = comments;
-  const pendingPinRef = useRef(pendingPin);
-  pendingPinRef.current = pendingPin;
 
-  // Highlight the hovered element during comment mode (visual feedback only)
-  const prepareHtml = (rawHtml: string): string => {
-    const helper = `
-      <style id="review-tool-anchor-styles">
-        [data-review-anchor-hover="true"] {
-          outline: 2px solid #4f46e5 !important;
-          outline-offset: 2px;
-        }
-      </style>
-    `;
-    if (rawHtml.includes('</head>')) {
-      return rawHtml.replace('</head>', `${helper}</head>`);
-    }
-    if (rawHtml.includes('</body>')) {
-      return rawHtml.replace('</body>', `${helper}</body>`);
-    }
-    return `${rawHtml}${helper}`;
-  };
+  const srcDoc = useMemo(
+    () => injectReviewBridge(project.htmlContent),
+    [project.htmlContent, REVIEW_BRIDGE_VERSION]
+  );
 
-  const refreshPinCoords = useCallback(() => {
-    const iframe = iframeRef.current;
-    if (!iframe?.contentDocument) return;
+  const postReviewMode = useCallback(() => {
+    iframeRef.current?.contentWindow?.postMessage(
+      { type: REVIEW_MODE_MESSAGE, active: activeTool === 'comment' },
+      '*'
+    );
+  }, [activeTool]);
 
-    const next: Record<string, { left: number; top: number }> = {};
-    for (const comment of commentsRef.current) {
-      next[comment.id] = resolvePinPosition(iframe, comment);
-    }
-    const pending = pendingPinRef.current;
-    if (pending) {
-      next.__pending = resolvePinPosition(iframe, pending);
-    }
-    setPinCoords((prev) => (coordsEqual(prev, next) ? prev : next));
-  }, []);
+  const postPins = useCallback(() => {
+    iframeRef.current?.contentWindow?.postMessage(
+      {
+        type: REVIEW_PINS_MESSAGE,
+        pins: markersFromComments(comments, pendingPin, selectedCommentId)
+      },
+      '*'
+    );
+  }, [comments, pendingPin, selectedCommentId]);
 
   // Sync the iframe height to its content's full document height so the outer
-  // canvas handles all scrolling. This eliminates internal iframe scroll and
-  // means getBoundingClientRect() inside the iframe gives stable document-relative
-  // coords that can be used directly as absolute pin positions.
+  // canvas handles all scrolling.
   useEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe) return;
@@ -163,7 +153,6 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
     const syncHeight = () => {
       const doc = iframe.contentDocument;
       if (!doc) return;
-      // Use standard max of documentElement and body scrollHeight
       const h = Math.max(
         doc.documentElement?.scrollHeight ?? 0,
         doc.body?.scrollHeight ?? 0,
@@ -172,7 +161,6 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
         820
       );
       setIframeHeight(h);
-      refreshPinCoords();
     };
 
     const attachObservers = () => {
@@ -180,9 +168,7 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
       const doc = iframe.contentDocument;
       if (!doc) return;
       ro?.disconnect();
-      ro = new ResizeObserver(() => {
-        syncHeight();
-      });
+      ro = new ResizeObserver(syncHeight);
       if (doc.documentElement) ro.observe(doc.documentElement);
       if (doc.body) ro.observe(doc.body);
     };
@@ -192,7 +178,6 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
       attachObservers();
     }
 
-    // Schedule re-checks after viewport switch animation completes
     const timer1 = setTimeout(syncHeight, 50);
     const timer2 = setTimeout(syncHeight, 250);
 
@@ -202,95 +187,80 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
       iframe.removeEventListener('load', attachObservers);
       ro?.disconnect();
     };
-  }, [project.htmlContent, viewportMode, zoomLevel, refreshPinCoords]);
+  }, [project.htmlContent, viewportMode, zoomLevel]);
 
   useEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe) return;
-
-    let resizeObserver: ResizeObserver | null = null;
-    let raf = 0;
-    let running = false;
-
-    const detach = () => {
-      running = false;
-      cancelAnimationFrame(raf);
-      resizeObserver?.disconnect();
-      resizeObserver = null;
+    const onLoad = () => {
+      postReviewMode();
+      postPins();
+      const selectedId = selectedCommentIdRef.current;
+      if (selectedId) {
+        iframe.contentWindow?.postMessage(
+          { type: REVIEW_SELECT_MESSAGE, id: selectedId },
+          '*'
+        );
+      }
     };
+    iframe.addEventListener('load', onLoad);
+    postReviewMode();
+    postPins();
+    return () => iframe.removeEventListener('load', onLoad);
+  }, [postReviewMode, postPins, srcDoc]);
 
-    const tick = () => {
-      if (!running) return;
-      refreshPinCoords();
-      raf = requestAnimationFrame(tick);
-    };
-
-    const attach = () => {
-      detach();
-      const win = iframe.contentWindow;
-      if (!win) return;
-      refreshPinCoords();
-      // Observe iframe element size (viewport mode / zoom changes)
-      resizeObserver = new ResizeObserver(refreshPinCoords);
-      resizeObserver.observe(iframe);
-      running = true;
-      raf = requestAnimationFrame(tick);
-    };
-
-    iframe.addEventListener('load', attach);
-    if (iframe.contentDocument?.readyState === 'complete') {
-      attach();
-    }
-
-    // The outer canvas is the scroll container for the full-height iframe.
-    // Refresh pin coords whenever it scrolls so positions stay accurate.
-    const canvas = document.getElementById('prototype-viewport-canvas');
-    canvas?.addEventListener('scroll', refreshPinCoords, { passive: true });
-    window.addEventListener('resize', refreshPinCoords);
-
-    return () => {
-      iframe.removeEventListener('load', attach);
-      canvas?.removeEventListener('scroll', refreshPinCoords);
-      window.removeEventListener('resize', refreshPinCoords);
-      detach();
-    };
-  }, [refreshPinCoords, project.htmlContent, viewportMode, zoomLevel]);
-
-  useEffect(() => {
-    refreshPinCoords();
-  }, [refreshPinCoords, comments, pendingPin, viewportMode, zoomLevel]);
-
-  // When a comment is selected in the sidebar, scroll the outer canvas so
-  // the pin is centred in the viewport.
   useEffect(() => {
     if (!selectedCommentId) return;
-    const iframe = iframeRef.current;
-    const comment = commentsRef.current.find((c) => c.id === selectedCommentId);
-    if (!iframe || !comment) return;
-    const pinTop = pinCoords[comment.id]?.top ?? (comment.yPercent / 100) * iframe.clientHeight;
-    const canvas = document.getElementById('prototype-viewport-canvas');
-    if (!canvas) return;
-    canvas.scrollTo({
-      top: pinTop - canvas.clientHeight / 2,
-      behavior: 'smooth'
-    });
-  }, [selectedCommentId, pinCoords]);
+    iframeRef.current?.contentWindow?.postMessage(
+      { type: REVIEW_SELECT_MESSAGE, id: selectedCommentId },
+      '*'
+    );
+  }, [selectedCommentId]);
 
   useEffect(() => {
-    return () => {
-      setHoverHighlight(iframeRef.current?.contentDocument ?? null, null);
-    };
-  }, [project.htmlContent, activeTool]);
+    const onMessage = (event: MessageEvent) => {
+      const iframe = iframeRef.current;
+      if (!iframe || event.source !== iframe.contentWindow) return;
+      const data = event.data;
+      if (!data || typeof data !== 'object') return;
 
-  const handleOverlayClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (activeTool !== 'comment') return;
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    const placement = capturePinAtPoint(iframe, e.clientX, e.clientY);
-    if (!placement) return;
-    setHoverHighlight(iframe.contentDocument, null);
-    onDropPin(placement);
-  };
+      if (data.type === REVIEW_PICK_MESSAGE) {
+        const placement = placementFromPick(data.target);
+        if (placement) onDropPinRef.current(placement);
+        return;
+      }
+      if (data.type === REVIEW_CANCEL_MESSAGE) {
+        onToolChangeRef.current('browse');
+        return;
+      }
+      if (data.type === REVIEW_OPEN_PIN_MESSAGE && typeof data.id === 'string') {
+        onSelectCommentRef.current(data.id);
+        return;
+      }
+      if (data.type === REVIEW_WHEEL_MESSAGE) {
+        const canvas = document.getElementById('prototype-viewport-canvas');
+        canvas?.scrollBy({
+          left: typeof data.deltaX === 'number' ? data.deltaX : 0,
+          top: typeof data.deltaY === 'number' ? data.deltaY : 0
+        });
+        return;
+      }
+      if (data.type === REVIEW_PIN_LOCATE_MESSAGE && typeof data.y === 'number') {
+        const canvas = document.getElementById('prototype-viewport-canvas');
+        if (!canvas) return;
+        const iframeRect = iframe.getBoundingClientRect();
+        const canvasRect = canvas.getBoundingClientRect();
+        const height = iframe.clientHeight || 1;
+        const visualY = iframeRect.top + (data.y / height) * iframeRect.height;
+        canvas.scrollBy({
+          top: visualY - (canvasRect.top + canvas.clientHeight / 2),
+          behavior: 'smooth'
+        });
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   // Drawing mouse handlers
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
@@ -369,23 +339,7 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
     setCurrentPoint(null);
   };
 
-  const isOverlayActive = activeTool !== 'browse';
-
-  useEffect(() => {
-    const node = overlayRef.current;
-    if (!node || !isOverlayActive) return;
-    const onWheel = (event: WheelEvent) => {
-      // The iframe is now full-height (no internal scroll) so we forward wheel
-      // events to the outer prototype-viewport-canvas instead.
-      const canvas = document.getElementById('prototype-viewport-canvas');
-      if (canvas) {
-        canvas.scrollBy({ left: event.deltaX, top: event.deltaY });
-      }
-      event.preventDefault();
-    };
-    node.addEventListener('wheel', onWheel, { passive: false });
-    return () => node.removeEventListener('wheel', onWheel);
-  }, [isOverlayActive]);
+  const isDrawingTool = ['pencil', 'rectangle', 'arrow'].includes(activeTool);
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden relative">
@@ -442,7 +396,7 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
             <div className="flex items-center gap-2 min-w-0">
               <span className="w-2 h-2 rounded-full bg-amber-300 animate-pulse shrink-0" />
               <span className="font-bold">Comment Mode:</span>
-              <span className="text-indigo-100 truncate">Click an element to attach feedback — the pin stays on that element as you scroll or change viewport</span>
+              <span className="text-indigo-100 truncate">Click a part of the page — the highlight is on the element, not a layer above it</span>
             </div>
             <button
               onClick={() => onToolChange('browse')}
@@ -461,7 +415,7 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
           className={`relative w-full rounded-b-xl ${
             activeTool === 'comment'
               ? 'cursor-crosshair'
-              : ['pencil', 'rectangle', 'arrow'].includes(activeTool)
+              : isDrawingTool
               ? 'cursor-cell'
               : 'cursor-default'
           }`}
@@ -471,64 +425,11 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
           <iframe
             ref={iframeRef}
             title={project.title}
-            srcDoc={prepareHtml(project.htmlContent)}
+            srcDoc={srcDoc}
             sandbox="allow-scripts allow-same-origin"
             className="w-full border-none block bg-white"
             style={{ height: iframeHeight }}
           />
-
-          {/* Interactive Annotation & Pin Layer (Intercepts clicks when not in 'browse' mode) */}
-          {isOverlayActive && (
-            <div
-              id="interaction-glass-overlay"
-              ref={overlayRef}
-              onClick={handleOverlayClick}
-              onMouseMove={(e) => {
-                if (activeTool !== 'comment') return;
-                const container = containerRef.current;
-                const iframe = iframeRef.current;
-                if (!container) return;
-                const rect = container.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) return;
-                setGhostPinPos({
-                  x: ((e.clientX - rect.left) / rect.width) * container.clientWidth,
-                  y: ((e.clientY - rect.top) / rect.height) * container.clientHeight
-                });
-                if (iframe) {
-                  const el = elementAtClientPoint(iframe, e.clientX, e.clientY);
-                  setHoveredSelector(el ? describeSelector(buildUniqueSelector(el)) : '');
-                  setHoverHighlight(iframe.contentDocument, el);
-                }
-              }}
-              onMouseLeave={() => {
-                setGhostPinPos(null);
-                setHoveredSelector('');
-                setHoverHighlight(iframeRef.current?.contentDocument ?? null, null);
-              }}
-              className="absolute inset-0 z-20"
-            />
-          )}
-
-          {/* Floating Ghost Pin on Hover in Comment Mode */}
-          {activeTool === 'comment' && ghostPinPos && !pendingPin && (
-            <div
-              className="absolute pointer-events-none z-35 -translate-x-1/2 -translate-y-1/2 transition-transform duration-75"
-              style={{ left: ghostPinPos.x, top: ghostPinPos.y }}
-            >
-              <div className="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-xs shadow-xl ring-4 ring-indigo-300 animate-pulse">
-                +
-              </div>
-              <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 bg-slate-950/95 text-white text-[11px] font-semibold px-2.5 py-1 rounded-full whitespace-nowrap shadow-xl border border-white/20 flex items-center gap-1.5 pointer-events-none">
-                <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-ping" />
-                <span>Attach to element</span>
-                {hoveredSelector && (
-                  <span className="text-slate-400 text-[10px] font-mono border-l border-slate-700 pl-1">
-                    {hoveredSelector}
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
 
           {/* SVG Visual Annotations (Drawings, Rectangles, Arrows) */}
           <svg
@@ -537,7 +438,7 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
             className={`absolute inset-0 w-full h-full z-25 ${
-              ['pencil', 'rectangle', 'arrow'].includes(activeTool) ? 'pointer-events-auto' : 'pointer-events-none'
+              isDrawingTool ? 'pointer-events-auto' : 'pointer-events-none'
             }`}
           >
             <defs>
@@ -641,135 +542,6 @@ export const PrototypeViewer: React.FC<PrototypeViewerProps> = ({
               />
             )}
           </svg>
-
-          {/* Render Comment Pin Markers */}
-          <div className="absolute inset-0 pointer-events-none z-30">
-            {comments.map((comment) => {
-              const isSelected = selectedCommentId === comment.id;
-              const isHovered = hoveredPinId === comment.id;
-              const isResolved = comment.status === 'resolved';
-              const pos = pinCoords[comment.id];
-              const canvasWidth = containerRef.current?.clientWidth ?? 1;
-              const canvasHeight = containerRef.current?.clientHeight ?? 1;
-              const left = pos?.left ?? (comment.xPercent / 100) * canvasWidth;
-              const top = pos?.top ?? (comment.yPercent / 100) * canvasHeight;
-
-              // Smart tooltip placement to prevent clipping against canvas edges
-              const isNearTop = top / canvasHeight < 0.22;
-              const isNearRight = left / canvasWidth > 0.7;
-              const isNearLeft = left / canvasWidth < 0.25;
-
-              const verticalClass = isNearTop ? 'top-full mt-2.5' : 'bottom-full mb-2.5';
-              const horizontalClass = isNearRight 
-                ? 'right-0' 
-                : isNearLeft 
-                ? 'left-0' 
-                : 'left-1/2 -translate-x-1/2';
-
-              return (
-                <div
-                  key={comment.id}
-                  id={`pin-marker-${comment.pinNumber}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSelectComment(comment.id);
-                  }}
-                  onMouseEnter={() => setHoveredPinId(comment.id)}
-                  onMouseLeave={() => setHoveredPinId(null)}
-                  className="absolute pointer-events-auto cursor-pointer -translate-x-1/2 -translate-y-1/2 hover:scale-125"
-                  style={{
-                    left,
-                    top
-                  }}
-                >
-                  {/* Pin Circle Badge */}
-                  <div
-                    className={`w-7 h-7 rounded-full flex items-center justify-center font-black text-xs shadow-lg ring-2 transition-all ${
-                      isSelected
-                        ? 'ring-indigo-500 scale-115'
-                        : isResolved
-                        ? 'ring-emerald-300'
-                        : 'ring-white'
-                    } ${
-                      isResolved
-                        ? 'bg-emerald-600 text-white'
-                        : comment.priority === 'critical'
-                        ? 'bg-rose-600 text-white'
-                        : comment.priority === 'high'
-                        ? 'bg-orange-500 text-white'
-                        : 'bg-slate-900 text-white'
-                    }`}
-                  >
-                    {comment.pinNumber}
-                  </div>
-
-                  {/* Pulsing ring for selected pin */}
-                  {isSelected && (
-                    <span className="absolute -inset-1 rounded-full bg-indigo-400/40 animate-ping pointer-events-none" />
-                  )}
-
-                  {/* Hover Tooltip Preview */}
-                  {isHovered && (
-                    <div 
-                      className={`absolute ${verticalClass} ${horizontalClass} w-64 bg-slate-900/95 backdrop-blur-md text-white text-xs rounded-xl p-3 shadow-2xl z-50 pointer-events-none border border-slate-700/90 ring-1 ring-white/10 animate-in fade-in zoom-in-95`}
-                    >
-                      <div className="flex items-center justify-between gap-2 mb-1.5 pb-1.5 border-b border-slate-800">
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <span className="w-5 h-5 rounded-full bg-indigo-600 text-white text-[10px] font-bold flex items-center justify-center shrink-0">
-                            #{comment.pinNumber}
-                          </span>
-                          <span className="font-bold text-xs text-slate-100 truncate">
-                            {comment.authorName}
-                          </span>
-                        </div>
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider shrink-0 ${
-                          comment.category === 'bug' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' :
-                          comment.category === 'design' ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' :
-                          comment.category === 'copy' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' :
-                          'bg-slate-700 text-slate-300'
-                        }`}>
-                          {comment.category}
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-200 line-clamp-3 leading-relaxed">
-                        {comment.content}
-                      </p>
-                      <div className="text-[10px] text-slate-400 mt-2 pt-1.5 border-t border-slate-800 flex items-center justify-between">
-                        <span className="font-semibold text-slate-300 flex items-center gap-1">
-                          <span className={`w-1.5 h-1.5 rounded-full ${
-                            comment.status === 'resolved' ? 'bg-emerald-400' :
-                            comment.status === 'in_progress' ? 'bg-blue-400' : 'bg-amber-400'
-                          }`} />
-                          {(comment?.status || 'open').replace('_', ' ').toUpperCase()}
-                        </span>
-                        <span className="text-slate-400 font-medium">Click pin to open →</span>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-
-            {/* Pending Pin Marker (Placed by user, waiting for comment submission) */}
-            {pendingPin && (
-              <div
-                id="pending-pin-marker"
-                className="absolute pointer-events-none -translate-x-1/2 -translate-y-1/2 z-35 animate-bounce"
-                style={{
-                  left:
-                    pinCoords.__pending?.left ??
-                    (pendingPin.xPercent / 100) * (containerRef.current?.clientWidth ?? 0),
-                  top:
-                    pinCoords.__pending?.top ??
-                    (pendingPin.yPercent / 100) * (containerRef.current?.clientHeight ?? 0)
-                }}
-              >
-                <div className="w-8 h-8 rounded-full bg-indigo-600 text-white flex items-center justify-center font-black text-sm shadow-xl ring-4 ring-indigo-300">
-                  +
-                </div>
-              </div>
-            )}
-          </div>
         </div>
       </div>
       </div>
